@@ -23,6 +23,10 @@ class AmbulanceVisualizer:
         self.fixed_camera = True
         self.show_patient_marker = True
         self.smoke_particles = []
+        self.mission_status = ""
+        self.status_timer = 0
+        self.patient_in_ambulance = False
+        self.patient_transition = 0.0
         
         self._init_opengl()
         
@@ -30,7 +34,7 @@ class AmbulanceVisualizer:
         glutInit()
         glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH | GLUT_MULTISAMPLE)
         glutInitWindowSize(self.window_width, self.window_height)
-        glutCreateWindow(b"Ambulance Sim - Perfect Alignment")
+        glutCreateWindow(b"Ambulance Mission Simulator")
         
         glutDisplayFunc(self._render)
         glutIdleFunc(self._update)
@@ -105,6 +109,16 @@ class AmbulanceVisualizer:
             self.frame_count = 0
             self.last_time = current_time
             
+        # Update patient transition
+        if self.env.patient_picked and not self.patient_in_ambulance:
+            self.patient_transition = min(1.0, self.patient_transition + time_elapsed * 2)
+            if self.patient_transition >= 1.0:
+                self.patient_in_ambulance = True
+        elif not self.env.patient_picked and self.patient_in_ambulance:
+            self.patient_transition = max(0.0, self.patient_transition - time_elapsed * 2)
+            if self.patient_transition <= 0.0:
+                self.patient_in_ambulance = False
+            
         # Enhanced wheel rotation physics
         speed = self.env.current_speed
         wheel_circumference = 2.0  # Approximate wheel circumference in meters
@@ -123,6 +137,13 @@ class AmbulanceVisualizer:
             self.light_flash = not self.light_flash
             self.light_timer = 0
             
+        # Update mission status timer
+        if self.mission_status:
+            self.status_timer += time_elapsed
+            if self.status_timer > 3.0:  # Show status for 3 seconds
+                self.mission_status = ""
+                self.status_timer = 0
+                
         glutPostRedisplay()
         
     def _update_smoke_particles(self, dt):
@@ -223,10 +244,6 @@ class AmbulanceVisualizer:
         self._draw_ambulance()
         self._draw_boundary_markers()
         
-        if self.show_patient_marker and not self.env.patient_picked:
-            self._draw_patient_marker()
-        
-        self._draw_hud()
         
         glutSwapBuffers()
     
@@ -360,11 +377,11 @@ class AmbulanceVisualizer:
         glLineWidth(1.0)
 
     def _draw_buildings(self):
-        """Draw hospitals"""
-        for hospital in self.env.hospitals:
-            self._draw_hospital(hospital)
+        """Draw hospitals with indicators for delivery points"""
+        for i, hospital in enumerate(self.env.hospitals):
+            self._draw_hospital(hospital, i)
             
-    def _draw_hospital(self, pos):
+    def _draw_hospital(self, pos, index):
         """Draw a properly scaled and aligned hospital"""
         x, y = pos
         glPushMatrix()
@@ -384,24 +401,26 @@ class AmbulanceVisualizer:
         # Scaled down red cross
         glColor3f(1, 0, 0)
         glPushMatrix()
-        glTranslatef(0, 0, 2.1)  # Adjusted height
-        glScalef(0.7, 0.14, 0.14)  # Original 1.0 * 0.7
+        glTranslatef(0, 0, 2.1)  
+        glScalef(0.7, 0.14, 0.14)  
         glutSolidCube(1)
         glPopMatrix()
         
         glPushMatrix()
-        glTranslatef(0, 0, 2.1)  # Adjusted height
-        glScalef(0.14, 0.7, 0.14)  # Original 1.0 * 0.7
+        glTranslatef(0, 0, 2.1)  
+        glScalef(0.14, 0.7, 0.14)  
         glutSolidCube(1)
         glPopMatrix()
         
         # Scaled down windows
         glColor4f(0.7, 0.8, 1.0, 0.7)
         glPushMatrix()
-        glTranslatef(0, -0.56, 1.05)  # Original 0.8 * 0.7
-        glScalef(0.56, 0.07, 1.4)  # Original 0.8 * 0.7, 0.1 * 0.7, 2.0 * 0.7
+        glTranslatef(0, -0.56, 1.05) 
+        glScalef(0.56, 0.07, 1.4)  
         glutSolidCube(1)
         glPopMatrix()
+        
+        
         
         glPopMatrix()
 
@@ -459,13 +478,17 @@ class AmbulanceVisualizer:
         glPopMatrix()
 
     def _draw_patients(self):
-        """Draw all patients with target highlighting"""
-        for patient in self.env.patients:
+        """Draw only active patients with target highlighting"""
+        for i, patient in enumerate(self.env.active_patients):
             is_target = (not self.env.patient_picked and 
                         np.allclose(patient, self.env.current_destination))
-            self._draw_patient(patient, is_target)
-                    
-    def _draw_patient(self, pos, is_target=False):
+            self._draw_patient(patient, is_target, i)
+            
+            # Draw the pulsing marker for current target
+            if is_target and self.show_patient_marker:
+                self._draw_patient_marker(patient, i)
+
+    def _draw_patient(self, pos, is_target=False, patient_id=0):
         """Draw a single patient"""
         x, y = pos
         glPushMatrix()
@@ -491,33 +514,49 @@ class AmbulanceVisualizer:
         glutSolidCube(1)  # Torso
         glPopMatrix()
         
+        # Patient ID badge
+        glDisable(GL_LIGHTING)
+        glColor3f(0, 0, 1)
+        glPushMatrix()
+        glTranslatef(0.2, 0, 0.35)
+        glScalef(0.1, 0.1, 0.01)
+        glutSolidCube(1)
         glPopMatrix()
-    
-    def _draw_patient_marker(self):
+        glEnable(GL_LIGHTING)
+        
+        glPopMatrix()
+
+    def _draw_patient_marker(self, patient, patient_id):
         """Pulsing marker above target patient"""
-        for patient in self.env.patients:
-            if (not self.env.patient_picked and 
-                np.allclose(patient, self.env.current_destination)):
-                x, y = patient
-                pulse = math.sin(time.time() * 5) * 0.1 + 0.5
-                
-                glDisable(GL_LIGHTING)
-                glColor3f(1, 1, 0)  # Yellow
-                glPushMatrix()
-                glTranslatef(x, y, 2)
-                glutSolidSphere(0.3 * pulse, 16, 16)
-                glPopMatrix()
-                
-                # Marker line
-                glBegin(GL_LINES)
-                glVertex3f(x, y, 2)
-                glVertex3f(x, y, 0.4)
-                glEnd()
-                glEnable(GL_LIGHTING)
-                break
+        try:
+            x, y = patient
+            pulse = math.sin(time.time() * 5) * 0.1 + 0.5
+            
+            glDisable(GL_LIGHTING)
+            glColor3f(1, 1, 0)  # Yellow
+            glPushMatrix()
+            glTranslatef(x, y, 2)
+            glutSolidSphere(0.3 * pulse, 16, 16)
+            glPopMatrix()
+            
+            # Marker line
+            glBegin(GL_LINES)
+            glVertex3f(x, y, 2)
+            glVertex3f(x, y, 0.4)
+            glEnd()
+            
+            # Text label
+            glRasterPos3f(x, y, 2.5)
+            text = f"Patient {patient_id+1}"
+            for char in text:
+                glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, ord(char))
+            
+            glEnable(GL_LIGHTING)
+        except:
+            pass
         
     def _draw_ambulance(self):
-        """Draw the ambulance with proper steering"""
+        """Draw the ambulance with proper steering and patient visualization"""
         x, y = self.env.ambulance_pos
         dir_x, dir_y = self.env.ambulance_dir
         
@@ -595,6 +634,33 @@ class AmbulanceVisualizer:
             glutSolidTorus(0.02, 0.08, 8, 16)
             glPopMatrix()
             
+        # Draw patient in ambulance (if picked up)
+        if self.patient_transition > 0:
+            glPushMatrix()
+            glTranslatef(0, 0, 0.5 * self.patient_transition)
+            
+            # Stretcher
+            glColor3f(0.5, 0.5, 0.5)
+            glPushMatrix()
+            glScalef(0.7, 0.25, 0.04)
+            glutSolidCube(1)
+            glPopMatrix()
+            
+            # Patient
+            glColor3f(1.0, 0.9, 0.8)  # Skin tone
+            glPushMatrix()
+            glTranslatef(0, 0, 0.1)
+            glutSolidSphere(0.12, 16, 16)  # Head
+            glPopMatrix()
+            
+            glPushMatrix()
+            glTranslatef(0, 0, 0.05)
+            glScalef(0.35, 0.15, 0.2)
+            glutSolidCube(1)  # Torso
+            glPopMatrix()
+            
+            glPopMatrix()
+            
         # Draw smoke particles
         self._draw_smoke_particles()
     
@@ -621,56 +687,7 @@ class AmbulanceVisualizer:
         glDisable(GL_BLEND)
         glEnable(GL_LIGHTING)
         
-    def _draw_hud(self):
-        """Draw heads-up display with info"""
-        glMatrixMode(GL_PROJECTION)
-        glPushMatrix()
-        glLoadIdentity()
-        gluOrtho2D(0, self.window_width, 0, self.window_height)
         
-        glMatrixMode(GL_MODELVIEW)
-        glPushMatrix()
-        glLoadIdentity()
-        
-        glDisable(GL_LIGHTING)
-        
-        # HUD background
-        glColor4f(0, 0, 0, 0.7)
-        glBegin(GL_QUADS)
-        glVertex2f(10, self.window_height - 140)
-        glVertex2f(350, self.window_height - 140)
-        glVertex2f(350, self.window_height - 10)
-        glVertex2f(10, self.window_height - 10)
-        glEnd()
-        
-        # HUD text
-        glColor3f(1, 1, 1)
-        y_pos = self.window_height - 30
-        lines = [
-            f"Position: ({self.env.ambulance_pos[0]:.2f}, {self.env.ambulance_pos[1]:.2f})",
-            f"Speed: {self.env.current_speed:.1f} km/h (Min: {self.env.min_speed:.1f}, Max: {self.env.max_speed:.1f})",
-            f"Wheel Angle: {math.degrees(self.env.wheel_angle):.1f}°",
-            f"Target: {self.env.current_destination}",
-            f"Patient: {'Picked' if self.env.patient_picked else 'Not Picked'}",
-            "Controls: Arrows=Rotate, CTRL+Arrows=Zoom, F=Toggle Follow, D=Debug"
-        ]
-        
-        for line in lines:
-            self._draw_hud_text(20, y_pos, line)
-            y_pos -= 25
-        
-        glMatrixMode(GL_PROJECTION)
-        glPopMatrix()
-        glMatrixMode(GL_MODELVIEW)
-        glPopMatrix()
-        glEnable(GL_LIGHTING)
-        
-    def _draw_hud_text(self, x, y, text):
-        """Draw text on HUD"""
-        glRasterPos2f(x, y)
-        for char in text:
-            glutBitmapCharacter(GLUT_BITMAP_9_BY_15, ord(char))
-            
     def close(self):
         """Cleanup"""
         glutDestroyWindow(glutGetWindow())
