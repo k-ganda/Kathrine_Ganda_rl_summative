@@ -2,34 +2,30 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import math
+import time
 from typing import Tuple, Dict, List, Optional, Any
 
 class AmbulanceEnv(gym.Env):
-    """Custom Gymnasium Environment for Ambulance Navigation"""
+    """Custom Ambulance Environment with Sequential Patient Pickups"""
     metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 30}
     
     def __init__(self, grid_size=(10, 10), render_mode: Optional[str] = None):
         super().__init__()
-        
         self.render_mode = render_mode
         self.viewer = None
         self.grid_size = grid_size
-        self.time_limit = 800
+        self.time_limit = 900  # Steps before timeout
         
-        # Car physics parameters
+        # Car physics
         self.wheel_angle = 0.0
         self.max_wheel_angle = math.radians(30)
         self.car_length = 2.0
         self.drift_factor = 0.95
-        
-        # Speed control
+        self.current_speed = 5.0
         self.min_speed = 1.0
         self.max_speed = 8.0
-        self.current_speed = 5.0
         self.acceleration = 0.2
         self.braking = 0.3
-        
-        # Physical dimensions
         self.ambulance_length = 0.8
         self.ambulance_width = 0.4
         
@@ -39,11 +35,14 @@ class AmbulanceEnv(gym.Env):
         self.min_y = self.ambulance_length/2
         self.max_y = grid_size[1] - self.ambulance_length/2
         
-        print(f"\nENVIRONMENT BOUNDARIES:")
-        print(f"X: {self.min_x:.2f} to {self.max_x:.2f}")
-        print(f"Y: {self.min_y:.2f} to {self.max_y:.2f}")
+        # Mission tracking
+        self.mission_start_time = 0
+        self.current_patient_id = 0
+        self.patients_picked = 0
+        self.total_patients = 3
+        self.mission_complete = False
         
-        # Initialize elements
+        # Initialize environment elements
         self._setup_fixed_elements()
         
         # Action space
@@ -57,40 +56,48 @@ class AmbulanceEnv(gym.Env):
             'position': spaces.Box(low=0, high=max(grid_size), shape=(2,), dtype=np.float32),
             'direction': spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32),
             'destination': spaces.Box(low=0, high=max(grid_size), shape=(2,), dtype=np.float32),
-            'patient_status': spaces.Discrete(2),
+            'patient_status': spaces.Discrete(2),  # 0=no patient, 1=has patient
             'time_elapsed': spaces.Box(low=0, high=self.time_limit, shape=(1,), dtype=np.float32),
             'obstacles': spaces.Box(low=0, high=max(grid_size), shape=(5, 2), dtype=np.float32),
-            'wheel_angle': spaces.Box(low=-self.max_wheel_angle, high=self.max_wheel_angle, shape=(1,), dtype=np.float32)
+            'wheel_angle': spaces.Box(low=-self.max_wheel_angle, high=self.max_wheel_angle, shape=(1,), dtype=np.float32),
+            'patients_remaining': spaces.Discrete(self.total_patients + 1)
         })
 
     def _setup_fixed_elements(self):
         """Initialize fixed environment elements"""
         self.fixed_hospitals = [(2.5, 2.5), (7.5, 7.5)]
         self.fixed_patients = [(3.0, 7.0), (7.0, 3.0), (8.0, 1.0)]
-        self.fixed_ambulance_start = (
-            np.clip(1.0, self.min_x, self.max_x),
-            np.clip(1.0, self.min_y, self.max_y)
-        )
+        self.fixed_ambulance_start = (1.0, 1.0)
         self.fixed_obstacles = [
             (1.5, 6.0), (1.5, 7.0),
             (6.0, 2.0), (7.0, 2.0),
-            (5.0, 5.0),
-            (5.0, 7.0)
+            (5.0, 5.0), (5.0, 7.0)
         ]
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict, Dict]:
         super().reset(seed=seed)
         
-        self.hospitals = self.fixed_hospitals.copy()
-        self.patients = self.fixed_patients.copy()
+        # Reset mission tracking
+        self.mission_start_time = time.time()
+        self.current_patient_id = 0
+        self.patients_picked = 0
+        self.mission_complete = False
+        self.time_elapsed = 0
+        
+        # Initialize positions
         self.ambulance_pos = np.array(self.fixed_ambulance_start, dtype=np.float32)
         self.ambulance_dir = np.array([0.0, 1.0])
         self.wheel_angle = 0.0
         self.current_speed = 5.0
         self.patient_picked = False
+        
+        # Initialize active elements
+        self.hospitals = self.fixed_hospitals.copy()
+        self.active_patients = self.fixed_patients.copy()
         self.obstacles = [np.array(pos, dtype=np.float32) for pos in self.fixed_obstacles]
-        self.current_destination = self.patients[0]
-        self.time_elapsed = 0
+        
+        # Set initial destination
+        self.current_destination = self.active_patients[self.current_patient_id]
         self.last_distance = self._calculate_distance(self.ambulance_pos, self.current_destination)
         
         if self.render_mode == 'human':
@@ -102,39 +109,90 @@ class AmbulanceEnv(gym.Env):
         self._take_action(action)
         self.time_elapsed += 1
         
-        reward = 0.0
+        base_reward = 0.0
         terminated = False
         truncated = False
+        status_update = ""
         
-        # Goal rewards
+        
+        
+        # 1. Directional reward (encourage moving toward destination)
+        direction_to_target = (self.current_destination - self.ambulance_pos)
+        if np.linalg.norm(direction_to_target) > 0.1:  # Avoid division by zero
+            direction_to_target /= np.linalg.norm(direction_to_target)
+            movement_alignment = np.dot(self.ambulance_dir, direction_to_target)
+            base_reward += 2.0 * max(0, movement_alignment)  # Only reward positive alignment
+        
+        # 2. Patient pickup logic
         if not self.patient_picked and self._is_at_location(self.ambulance_pos, [self.current_destination]):
             self.patient_picked = True
-            reward += 500
+            base_reward += 800  # Increased pickup reward
+            status_update = f"Patient {self.current_patient_id+1} PICKED UP - Heading to hospital"
+            
+            if self.current_patient_id < len(self.active_patients):
+                self.active_patients.pop(self.current_patient_id)
+            self.patients_picked += 1
+            
+            # Progressive bonus for each patient picked
+            base_reward += 200 * self.patients_picked
+            
             self.current_destination = self._nearest_hospital()
             self.last_distance = self._calculate_distance(self.ambulance_pos, self.current_destination)
-        elif self.patient_picked and self._is_at_location(self.ambulance_pos, self.hospitals):
-            reward += 1000
-            terminated = True
         
-        # Efficiency reward
+        # 3. Hospital delivery logic
+        elif self.patient_picked and self._is_at_location(self.ambulance_pos, self.hospitals):
+            delivery_reward = 1200 + (500 * self.patients_picked)  # Scaling delivery reward
+            base_reward += delivery_reward
+            self.patient_picked = False
+            
+            if self.active_patients:
+                self.current_patient_id = min(self.current_patient_id, len(self.active_patients)-1)
+                self.current_destination = self.active_patients[self.current_patient_id]
+                status_update = f"Patient DELIVERED - Now heading to Patient {self.current_patient_id+1}"
+            else:
+                terminated = True
+                self.mission_complete = True
+                # Final completion bonus based on speed
+                completion_bonus = 1000 * (1 - (self.time_elapsed/self.time_limit))
+                base_reward += completion_bonus
+                status_update = f"MISSION COMPLETE! Bonus: {completion_bonus:.0f}"
+        
+        # 4. Distance-based efficiency reward
         current_distance = self._calculate_distance(self.ambulance_pos, self.current_destination)
-        reward += (self.last_distance - current_distance) * 10
+        distance_improvement = self.last_distance - current_distance
+        if distance_improvement > 0:
+            base_reward += 25 * distance_improvement  
         self.last_distance = current_distance
         
-        # Penalties
+        # 5. Collision penalty 
         if self._check_collision():
-            reward -= 1000
+            collision_penalty = -200  
+            base_reward += collision_penalty
             terminated = True
+            status_update = "COLLISION! Mission failed"
         
-        reward -= 1  # Time penalty
+        # 6. Time management (small constant penalty per step)
+        base_reward -= 0.2  
         
-        if self.time_elapsed > self.time_limit:
+        # 7. Speed management (optimal speed range)
+        optimal_speed = 5.0  # Mid-range speed
+        speed_penalty = -0.1 * abs(self.current_speed - optimal_speed)
+        base_reward += speed_penalty
+        
+        # 8. Timeout check
+        if self.time_elapsed >= self.time_limit:
             truncated = True
+            # Partial completion reward
+            if self.patients_picked > 0:
+                base_reward += 300 * self.patients_picked
+            status_update = f"TIME OUT! Partial reward: {300 * self.patients_picked:.0f}"
+        
+        
         
         if self.render_mode == 'human':
             self.render()
             
-        return self._get_observation(), reward, terminated, truncated, {}
+        return self._get_observation(), base_reward, terminated, truncated, {"status": status_update}
 
     def _take_action(self, action: Dict) -> None:
         steering = action["steering"]
@@ -208,7 +266,8 @@ class AmbulanceEnv(gym.Env):
             'patient_status': int(self.patient_picked),
             'time_elapsed': np.array([self.time_elapsed], dtype=np.float32),
             'obstacles': np.array(self.obstacles[:5], dtype=np.float32),
-            'wheel_angle': np.array([self.wheel_angle], dtype=np.float32)
+            'wheel_angle': np.array([self.wheel_angle], dtype=np.float32),
+            'patients_remaining': np.array([self.total_patients - self.patients_picked], dtype=np.int32)
         }
 
     def _check_collision(self) -> bool:
