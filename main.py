@@ -90,7 +90,7 @@ def visualize_model(model_path: str, num_episodes: int = 3) -> None:
 
 if __name__ == "__main__":
     visualize_model(
-        model_path="models/lr5e-4.zip",
+        model_path="models/dqn/lr5e-4.zip",
         num_episodes=3
     )
 

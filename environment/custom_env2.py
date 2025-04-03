@@ -292,7 +292,7 @@ class AmbulanceEnv(gym.Env):
     def render(self) -> Optional[np.ndarray]:
         if self.render_mode == 'human':
             if self.viewer is None:
-                from rendering import AmbulanceVisualizer
+                from implementation.rendering import AmbulanceVisualizer
                 self.viewer = AmbulanceVisualizer(self)
             return self.viewer.render()
         return None
